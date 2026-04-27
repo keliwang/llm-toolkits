@@ -5,7 +5,8 @@
 1. usage 中出现 cache_creation_input_tokens，说明观测到缓存写入
 2. usage 中出现 cache_read_input_tokens，说明观测到缓存命中
 
-脚本同时报告请求接受度，帮助区分“接口接受了 cache_control”与“本次已观测到缓存生效”。
+默认使用真实 tool_use/tool_result 多轮请求探测，脚本同时报告请求接受度，
+帮助区分“接口接受了 cache_control”与“本次已观测到缓存生效”。
 """
 
 from __future__ import annotations
@@ -26,6 +27,12 @@ SOURCE_PARAGRAPH = (
     "provider implementation. This paragraph is repeated to build a long, "
     "stable cacheable prefix for runtime probing. "
 )
+TOOL_NAME = "prompt_cache_probe_lookup"
+TOOL_RESULT = {
+    "source": "local_probe_tool",
+    "value": "ok",
+    "confidence": 1.0,
+}
 
 
 def _build_probe_text(repeat_count: int) -> str:
@@ -98,6 +105,101 @@ def _extract_usage_metrics(body: dict[str, Any]) -> dict[str, int | float | None
             ("output_tokens", "outputTokens"),
         ),
     }
+
+
+def _build_system_blocks(probe_text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "text",
+            "text": probe_text,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+def _build_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": TOOL_NAME,
+            "description": (
+                "Return deterministic probe data for prompt cache runtime checks. "
+                "Use this tool whenever the user asks for cache probe lookup data."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "probe_key": {
+                        "type": "string",
+                        "description": "Stable probe key supplied by the caller.",
+                    },
+                },
+                "required": ["probe_key"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _build_repeat_body(model: str, probe_text: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "max_tokens": 64,
+        "system": _build_system_blocks(probe_text),
+        "messages": [{"role": "user", "content": "reply just 'ok'"}],
+    }
+
+
+def _build_tool_body(
+    model: str,
+    probe_text: str,
+    messages: list[dict[str, Any]],
+    forced_tool_name: str | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 128,
+        "system": _build_system_blocks(probe_text),
+        "tools": _build_tools(),
+        "messages": messages,
+    }
+    if forced_tool_name is not None:
+        body["tool_choice"] = {"type": "tool", "name": forced_tool_name}
+    return body
+
+
+def _normalize_assistant_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text" and isinstance(block.get("text"), str):
+            normalized.append({"type": "text", "text": block["text"]})
+        elif block_type == "tool_use":
+            tool_use_id = block.get("id")
+            name = block.get("name")
+            tool_input = block.get("input")
+            if isinstance(tool_use_id, str) and isinstance(name, str):
+                normalized.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": name,
+                        "input": tool_input if isinstance(tool_input, dict) else {},
+                    }
+                )
+    return normalized
+
+
+def _find_tool_use(content: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for block in content:
+        if block.get("type") == "tool_use" and block.get("name") == TOOL_NAME:
+            return block
+    return None
 
 
 def _compute_cache_ratio(round_detail: dict[str, Any]) -> float | None:
@@ -173,6 +275,7 @@ def _send_probe_round(
     url: str,
     headers: dict[str, str],
     body: dict[str, Any],
+    stage: str,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     response = client.post(url, headers=headers, json=body)
@@ -180,6 +283,7 @@ def _send_probe_round(
 
     if response.status_code < 200 or response.status_code >= 300:
         return {
+            "stage": stage,
             "status_code": response.status_code,
             "elapsed_ms": elapsed_ms,
             "error": response.text[:1000],
@@ -192,13 +296,19 @@ def _send_probe_round(
 
     metrics = _extract_usage_metrics(payload)
     return {
+        "stage": stage,
         "status_code": response.status_code,
         "elapsed_ms": elapsed_ms,
         **metrics,
+        "_payload": payload,
     }
 
 
-def _run_strategy(
+def _public_round_detail(round_detail: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in round_detail.items() if key != "_payload"}
+
+
+def _run_repeat_strategy(
     client: httpx.Client,
     base_url: str,
     model: str,
@@ -208,18 +318,7 @@ def _run_strategy(
     rounds: int,
     round_delay_ms: int,
 ) -> dict[str, Any]:
-    body = {
-        "model": model,
-        "max_tokens": 64,
-        "system": [
-            {
-                "type": "text",
-                "text": probe_text,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ],
-        "messages": [{"role": "user", "content": "reply just 'ok'"}],
-    }
+    body = _build_repeat_body(model=model, probe_text=probe_text)
     request_headers = {**base_headers, **extra_headers}
     request_url = f"{base_url.rstrip('/')}/v1/messages"
 
@@ -231,15 +330,111 @@ def _run_strategy(
                 url=request_url,
                 headers=request_headers,
                 body=body,
+                stage="repeat",
             )
         )
         if round_index < rounds - 1 and round_delay_ms > 0:
             time.sleep(round_delay_ms / 1000)
 
-    summary = _classify_strategy(round_details)
+    public_rounds = [_public_round_detail(round_detail) for round_detail in round_details]
+    summary = _classify_strategy(public_rounds)
     return {
+        "probe_mode": "repeat",
         "headers": extra_headers,
-        "rounds": round_details,
+        "rounds": public_rounds,
+        **summary,
+    }
+
+
+def _run_tool_strategy(
+    client: httpx.Client,
+    base_url: str,
+    model: str,
+    probe_text: str,
+    base_headers: dict[str, str],
+    extra_headers: dict[str, str],
+    rounds: int,
+    round_delay_ms: int,
+    force_tool_choice: bool,
+) -> dict[str, Any]:
+    request_headers = {**base_headers, **extra_headers}
+    request_url = f"{base_url.rstrip('/')}/v1/messages"
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": (
+                f"Call {TOOL_NAME} with probe_key='alpha'. "
+                "After the tool result, answer exactly ok."
+            ),
+        }
+    ]
+
+    round_details: list[dict[str, Any]] = []
+    expect_tool = True
+    for round_index in range(rounds):
+        stage = "tool_request" if expect_tool else "tool_result_followup"
+        body = _build_tool_body(
+            model=model,
+            probe_text=probe_text,
+            messages=messages,
+            forced_tool_name=TOOL_NAME if expect_tool and force_tool_choice else None,
+        )
+        round_detail = _send_probe_round(
+            client=client,
+            url=request_url,
+            headers=request_headers,
+            body=body,
+            stage=stage,
+        )
+        round_details.append(round_detail)
+
+        if "error" in round_detail:
+            break
+
+        payload = round_detail.get("_payload")
+        assistant_content = (
+            _normalize_assistant_content(payload) if isinstance(payload, dict) else []
+        )
+        tool_use = _find_tool_use(assistant_content)
+
+        public_detail = round_details[-1]
+        public_detail["tool_use_observed"] = tool_use is not None
+
+        if tool_use is not None:
+            messages.append({"role": "assistant", "content": assistant_content})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": json.dumps(TOOL_RESULT, ensure_ascii=False),
+                        }
+                    ],
+                }
+            )
+            expect_tool = False
+        else:
+            if assistant_content:
+                messages.append({"role": "assistant", "content": assistant_content})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Continue the cache probe and answer exactly ok.",
+                }
+            )
+            expect_tool = False
+
+        if round_index < rounds - 1 and round_delay_ms > 0:
+            time.sleep(round_delay_ms / 1000)
+
+    public_rounds = [_public_round_detail(round_detail) for round_detail in round_details]
+    summary = _classify_strategy(public_rounds)
+    return {
+        "probe_mode": "tool",
+        "headers": extra_headers,
+        "rounds": public_rounds,
         **summary,
     }
 
@@ -261,6 +456,48 @@ def _strategy_rank(strategy_result: dict[str, Any]) -> tuple[int, int, int]:
     )
 
 
+def _probe_mode_order(probe_mode: str) -> list[str]:
+    if probe_mode == "auto":
+        return ["tool", "repeat"]
+    return [probe_mode]
+
+
+def _run_probe_strategy(
+    probe_mode: str,
+    client: httpx.Client,
+    base_url: str,
+    model: str,
+    probe_text: str,
+    base_headers: dict[str, str],
+    strategy_headers: dict[str, str],
+    rounds: int,
+    round_delay_ms: int,
+    force_tool_choice: bool,
+) -> dict[str, Any]:
+    if probe_mode == "tool":
+        return _run_tool_strategy(
+            client=client,
+            base_url=base_url,
+            model=model,
+            probe_text=probe_text,
+            base_headers=base_headers,
+            extra_headers=strategy_headers,
+            rounds=rounds,
+            round_delay_ms=round_delay_ms,
+            force_tool_choice=force_tool_choice,
+        )
+    return _run_repeat_strategy(
+        client=client,
+        base_url=base_url,
+        model=model,
+        probe_text=probe_text,
+        base_headers=base_headers,
+        extra_headers=strategy_headers,
+        rounds=rounds,
+        round_delay_ms=round_delay_ms,
+    )
+
+
 def check_cache_support(
     model: str,
     base_url: str,
@@ -270,6 +507,8 @@ def check_cache_support(
     repeat_count: int = 64,
     rounds: int = 2,
     round_delay_ms: int = 250,
+    probe_mode: str = "auto",
+    force_tool_choice: bool = False,
     extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     import httpx
@@ -287,21 +526,30 @@ def check_cache_support(
     strategies: dict[str, Any] = {}
 
     with httpx.Client(timeout=timeout) as client:
-        for strategy_name, strategy_headers in _strategy_order(beta_mode):
-            result = _run_strategy(
-                client=client,
-                base_url=base_url,
-                model=model,
-                probe_text=probe_text,
-                base_headers=base_headers,
-                extra_headers=strategy_headers,
-                rounds=rounds,
-                round_delay_ms=round_delay_ms,
-            )
-            strategies[strategy_name] = result
-            if strategy_name == "standard" and beta_mode == "auto":
-                if result["cache_read_detected"] or result["cache_creation_detected"]:
-                    break
+        for current_probe_mode in _probe_mode_order(probe_mode):
+            for strategy_name, strategy_headers in _strategy_order(beta_mode):
+                result = _run_probe_strategy(
+                    probe_mode=current_probe_mode,
+                    client=client,
+                    base_url=base_url,
+                    model=model,
+                    probe_text=probe_text,
+                    base_headers=base_headers,
+                    strategy_headers=strategy_headers,
+                    rounds=rounds,
+                    round_delay_ms=round_delay_ms,
+                    force_tool_choice=force_tool_choice,
+                )
+                result_name = f"{current_probe_mode}/{strategy_name}"
+                strategies[result_name] = result
+                if strategy_name == "standard" and beta_mode == "auto":
+                    if result["cache_read_detected"] or result["cache_creation_detected"]:
+                        break
+            if probe_mode == "auto" and any(
+                strategy["cache_read_detected"] or strategy["cache_creation_detected"]
+                for strategy in strategies.values()
+            ):
+                break
 
     selected_strategy_name, selected_strategy = max(
         strategies.items(),
@@ -329,6 +577,8 @@ def check_cache_support(
         "probe_repeat_count": repeat_count,
         "rounds": rounds,
         "round_delay_ms": round_delay_ms,
+        "probe_mode": probe_mode,
+        "force_tool_choice": force_tool_choice,
         "beta_mode": beta_mode,
         "selected_strategy": selected_strategy_name,
         "prompt_cache_supported": prompt_cache_supported,
@@ -381,6 +631,17 @@ def main() -> None:
         help="轮次之间的等待时间，单位毫秒，默认 250",
     )
     parser.add_argument(
+        "--probe-mode",
+        choices=("auto", "tool", "repeat"),
+        default="auto",
+        help="探测流程: auto/tool/repeat，默认 auto",
+    )
+    parser.add_argument(
+        "--force-tool-choice",
+        action="store_true",
+        help="发送 tool_choice 强制模型调用探测工具，适用于支持该参数的接口",
+    )
+    parser.add_argument(
         "--header",
         action="append",
         default=[],
@@ -421,6 +682,8 @@ def main() -> None:
         repeat_count=args.repeat_count,
         rounds=args.rounds,
         round_delay_ms=args.round_delay_ms,
+        probe_mode=args.probe_mode,
+        force_tool_choice=args.force_tool_choice,
         extra_headers=extra_headers,
     )
 
@@ -439,6 +702,8 @@ def main() -> None:
         print(f"Probe Repeat Count:   {result['probe_repeat_count']}")
         print(f"Rounds Per Strategy:  {result['rounds']}")
         print(f"Round Delay Ms:       {result['round_delay_ms']}")
+        print(f"Probe Mode:           {result['probe_mode']}")
+        print(f"Force Tool Choice:    {result['force_tool_choice']}")
         print(f"Beta Mode:            {result['beta_mode']}")
         print(f"Cache Creation:       {'✓' if result['cache_creation_detected'] else '·'}")
         print(f"Cache Read:           {'✓' if result['cache_read_detected'] else '·'}")
@@ -453,11 +718,14 @@ def main() -> None:
             for index, round_detail in enumerate(strategy["rounds"], start=1):
                 print(
                     f"round{index}: status={round_detail.get('status_code')} "
-                    f"elapsed_ms={round_detail.get('elapsed_ms')}"
+                    f"elapsed_ms={round_detail.get('elapsed_ms')} "
+                    f"stage={round_detail.get('stage')}"
                 )
                 if "error" in round_detail:
                     print(f"  error={round_detail['error']}")
                     continue
+                if "tool_use_observed" in round_detail:
+                    print(f"  tool_use_observed={round_detail['tool_use_observed']}")
                 print(
                     "  usage="
                     f"create={round_detail.get('cache_creation_input_tokens')} "
