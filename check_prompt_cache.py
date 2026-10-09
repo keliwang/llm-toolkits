@@ -7,11 +7,13 @@
 
 默认使用真实 tool_use/tool_result 多轮请求探测，脚本同时报告请求接受度，
 帮助区分“接口接受了 cache_control”与“本次已观测到缓存生效”。
+--probe-mode agent 则逐场景模拟 Claude Code 风格的完整历史、thinking 和工具循环。
 """
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import os
 import sys
@@ -172,27 +174,8 @@ def _normalize_assistant_content(payload: dict[str, Any]) -> list[dict[str, Any]
     if not isinstance(content, list):
         return []
 
-    normalized: list[dict[str, Any]] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "text" and isinstance(block.get("text"), str):
-            normalized.append({"type": "text", "text": block["text"]})
-        elif block_type == "tool_use":
-            tool_use_id = block.get("id")
-            name = block.get("name")
-            tool_input = block.get("input")
-            if isinstance(tool_use_id, str) and isinstance(name, str):
-                normalized.append(
-                    {
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": name,
-                        "input": tool_input if isinstance(tool_input, dict) else {},
-                    }
-                )
-    return normalized
+    # Thinking signatures and redacted data are opaque and must round-trip intact.
+    return deepcopy([block for block in content if isinstance(block, dict)])
 
 
 def _find_tool_use(content: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -511,6 +494,8 @@ def check_cache_support(
     force_tool_choice: bool = False,
     extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if probe_mode not in {"auto", "tool", "repeat"}:
+        raise ValueError("Use agent_cache_probe.run_agent_suite for the agent probe mode")
     import httpx
 
     base_headers = {
@@ -632,10 +617,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--probe-mode",
-        choices=("auto", "tool", "repeat"),
+        choices=("auto", "tool", "repeat", "agent"),
         default="auto",
-        help="探测流程: auto/tool/repeat，默认 auto",
+        help="探测流程: auto/tool/repeat/agent；agent 逐场景模拟 Claude Code 多轮请求",
     )
+    agent = parser.add_argument_group("Claude Code 风格 agent 场景 (--probe-mode agent)")
+    from agent_cache_probe import SCENARIOS, THINKING_SCENARIOS
+
+    agent.add_argument("--scenario", choices=SCENARIOS, action="append", help="选择场景，可重复；默认全部场景")
+    agent.add_argument("--cache-strategy", choices=("claude-code", "system"), action="append", help="缓存策略，可重复对比；默认 claude-code（system + 消息末尾断点）")
+    agent.add_argument("--effort", choices=("none", "low", "medium", "high", "xhigh", "max"), default="high", help="agent 请求的 output_config.effort，默认 high，整个场景保持不变；none 不发送 output_config")
+    agent.add_argument("--thinking", choices=("adaptive", "enabled", "off"), default="adaptive", help="thinking 配置：adaptive（默认）、enabled（手动预算，适合不支持 adaptive 的模型）、off（不发送 thinking，默认跳过 thinking 场景）")
+    agent.add_argument("--thinking-budget", type=int, default=4096, help="--thinking enabled 的 budget_tokens，默认 4096，需 >=1024 且小于 --max-tokens")
+    agent.add_argument("--usage-accounting", choices=("auto", "anthropic", "implicit", "total"), default="auto", help="输入计数口径：auto 校准；anthropic=input+read+create；implicit=input+read；total=input 已包含全部输入")
+    agent.add_argument("--min-prefix-reuse", type=float, default=0.95, help="每次实际推进的旧输入复用率验收目标，0~1，默认 0.95；旧输入包含静态上下文")
+    agent.add_argument("--max-tokens", type=int, default=8192, help="agent 单请求输出上限，默认 8192")
+    agent.add_argument("--cache-ttl", choices=("5m", "1h"), default="5m", help="统一断点 TTL，默认 5m（API key 模式）")
+    agent.add_argument("--pin-previous-message", action="store_true", help="额外标记前一可缓存消息，模拟 Claude Code 可选的 fork cache pin")
+    agent.add_argument("--agent-turns", type=int, default=3, help="普通对话用户轮数，默认 3")
+    agent.add_argument("--max-agent-requests", type=int, default=8, help="每个场景主链路请求上限，不含校准和重放，默认 8")
+    agent.add_argument("--tool-output-lines", type=int, default=128, help="虚拟源码工具结果的上下文行数，默认 128")
+    agent.add_argument("--no-stream", action="store_true", help="关闭 agent 默认的 SSE 流式请求")
+    agent.add_argument("--dry-run", action="store_true", help="打印场景计划和首轮请求体，不调用接口")
+    agent.add_argument("--verbose", action="store_true", help="agent 报告输出每轮完整 usage 和估算明细")
     parser.add_argument(
         "--force-tool-choice",
         action="store_true",
@@ -672,6 +676,52 @@ def main() -> None:
         extra_headers = _parse_header_values(args.header)
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.dry_run and args.probe_mode != "agent":
+        parser.error("--dry-run 需要 --probe-mode agent")
+    if args.probe_mode == "agent":
+        from agent_cache_probe import run_agent_suite, print_report
+
+        if args.force_tool_choice:
+            parser.error("agent 模式使用默认 tool_choice，不能搭配 --force-tool-choice")
+        if args.agent_turns < 3 or args.max_agent_requests < args.agent_turns:
+            parser.error("--agent-turns 至少为 3，--max-agent-requests 不能小于它")
+        if args.max_tokens < 1:
+            parser.error("--max-tokens 必须为正数")
+        if args.tool_output_lines < 0:
+            parser.error("--tool-output-lines 不能为负数")
+        if not 0 <= args.min_prefix_reuse <= 1:
+            parser.error("--min-prefix-reuse 必须在 0~1 之间")
+        if args.thinking == "enabled" and not 1024 <= args.thinking_budget < args.max_tokens:
+            parser.error("--thinking-budget 需 >=1024 且小于 --max-tokens")
+        if args.thinking == "off" and set(args.scenario or ()) & set(THINKING_SCENARIOS):
+            parser.error("--thinking off 不能搭配 thinking_* 场景")
+        scenarios = list(dict.fromkeys(args.scenario or (
+            [scenario for scenario in SCENARIOS if scenario not in THINKING_SCENARIOS]
+            if args.thinking == "off" else SCENARIOS
+        )))
+        if args.beta_mode == "on":
+            extra_headers["anthropic-beta"] = ",".join(filter(None, (extra_headers.get("anthropic-beta"), "prompt-caching-2024-07-31")))
+        result = run_agent_suite(
+            model=args.model, base_url=args.base_url, api_key=args.api_key,
+            probe_text=_build_probe_text(args.repeat_count),
+            scenarios=scenarios,
+            cache_strategies=list(dict.fromkeys(args.cache_strategy or ["claude-code"])),
+            effort=None if args.effort == "none" else args.effort,
+            thinking=args.thinking, thinking_budget=args.thinking_budget,
+            max_tokens=args.max_tokens, ttl=args.cache_ttl,
+            stream=not args.no_stream, pin_previous_message=args.pin_previous_message,
+            turns=args.agent_turns, max_requests=args.max_agent_requests,
+            tool_output_lines=args.tool_output_lines, round_delay_ms=args.round_delay_ms,
+            timeout=args.timeout, extra_headers=extra_headers, dry_run=args.dry_run,
+            usage_accounting=args.usage_accounting, min_prefix_reuse=args.min_prefix_reuse,
+        )
+        if args.json_output or args.dry_run:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print_report(result, verbose=args.verbose)
+        # Exit on cache verdicts; flow completeness is reported separately.
+        sys.exit(0 if args.dry_run or result["all_cache_requirements_met"] else 1)
 
     result = check_cache_support(
         model=args.model,
