@@ -236,6 +236,72 @@ JSON 报告包含逐轮 usage、命中比例、耗时、stop_reason、thinking/�
 `--header 'Name: Value'`。Agent 模式下 `--beta-mode auto` 不做旧缓存 beta 的
 自动回退，以免改变场景内的请求配置；`on` 可显式添加旧 header。
 
+## 真实 Claude Code 会话探测
+
+`claude_code_probe.py` 不再模拟请求：它在隔离的临时目录里生成一个小 Python
+仓库，用 `claude -p --input-format stream-json` 驱动真实 Claude Code CLI 完成一个
+多轮任务，结束后直接分析该会话的 session log（`projects/<cwd>/<session>.jsonl`
+以及 `<session>/subagents/*.jsonl`）。
+
+```sh
+# 网关 / API key：配置目录完全隔离（新建空的 CLAUDE_CONFIG_DIR）
+uv run claude_code_probe.py --model YOUR_MODEL --base-url https://gw.example.com --api-key sk-... --subagent
+
+# 只分析已有 session log，例如自己日常的会话
+uv run claude_code_probe.py --analyze ~/.claude/projects/<project>/<session>.jsonl
+```
+
+同一个 Claude Code 进程、同一个 session 内依次发送以下用户轮次，每轮等到
+`result` 事件后再发下一轮：
+
+| 轮次 | 任务 | 覆盖的环节 |
+| --- | --- | --- |
+| `fix` | 读 PROBE.md → 读 config/project.json 找入口 → 并行读两个配置 → Bash 跑测试 → thinking 后 Edit 修 bug → 再跑测试 | 顺序工具链、并行工具、Bash、Edit、thinking 与工具交错 |
+| `explain` | 不用工具，解释修复 | 普通文本多轮；历史中已有 thinking |
+| `extend` | 新增 `test_unknown_currency` 并运行测试 | 普通 user 消息之后再进入工具链 |
+| `subagent`（`--subagent`） | 通过 Agent/Task 工具启动 general-purpose 子 agent 读文件 | 子 agent 的 sidechain 缓存 |
+
+隔离方式：
+
+- workspace 是新建临时目录（或 `--root` 指定的空目录），不是 git 仓库，没有 CLAUDE.md。
+- 默认新建空的 `CLAUDE_CONFIG_DIR`：不加载本机用户 settings、CLAUDE.md、插件、hooks、
+  MCP 和登录态，session log 也写在运行目录里。
+- 真实运行必须显式传 `--api-key` 或 `--auth-token`（至少一个），否则直接报错退出。
+  当前环境里的 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、
+  `CLAUDE_CODE_OAUTH_TOKEN` 一律不传给子进程，避免误用别的凭据或误打到别的接口；
+  不指定 `--base-url` 时使用官方 API。`--analyze` 不需要凭据。
+- 工具限定为 Read/Glob/Grep/Edit/Write/Bash（`--subagent` 时加 Agent），`acceptEdits`
+  模式，Bash 只放行 `python3 -m unittest`；`--strict-mcp-config` 不加载 MCP。
+- 剥离父 Claude Code 会话注入的环境变量（`CLAUDECODE`、`CLAUDE_CODE_SESSION_ID` 等），
+  可以在 Claude Code 里运行本脚本。
+
+运行目录保留 `workspace/`、`stream.jsonl`（CLI 输出事件）、`stderr.log` 和隔离配置，
+便于复查。`--claude-arg` 原样透传额外 CLI 参数，例如 `--claude-arg=--max-budget-usd=1`。
+
+### 分析方法
+
+session log 里每个内容块一行；并行工具调用时 `tool_result` 会插在同一响应的块之间，
+所以按 `message.id`（缺失时用 `requestId`）在整个文件内归并为一次 API 请求，跳过
+`<synthetic>` 和 API 错误消息。每个链（主会话、每个子 agent）独立分析：
+
+- Claude Code 在最后一条消息上打缓存断点，因此第 n 个请求应至少读到第 n-1 个请求的
+  输入总量 `P = input + cache_read + cache_creation`。
+- `read ≥ 阈值 × P` 为 `HIT`，`0 < read` 为 `PARTIAL`，`read = 0` 为 `MISS`；首个请求标为
+  `FIRST`，没有期望值。`(t)`、`Δread`、`◀` 读取下降标记以及 `PASS`/`PARTIAL REUSE`/
+  `CACHE NOT VERIFIED`/`REUSE UNKNOWN` 的含义与 agent 模拟场景一致。
+- `after` 列区分请求是跟在 `tool_result` 还是新的用户输入之后，汇总
+  `user-prompt boundary hits`，用于定位“换轮时丢缓存”。
+- 正常情况下每步只差末尾少量未缓存 token（Claude Code 会话里通常是 2）。
+
+流程检查（`flow=COMPLETE|INCOMPLETE`）确认任务真的走过了每个环节：多轮 Read、
+单次响应多个工具、Bash、Edit、纯文本轮、普通追问后的工具调用、thinking 出现且
+进入缓存前缀、子 agent 日志，并在结束后自己运行一次单元测试确认任务完成。模型
+不产生 thinking 时可用 `--allow-no-thinking`。
+
+退出码：主会话和所有子 agent 链都 `PASS` 时为 0，否则为 1；CLI 运行出错或找不到
+session log 时为 2。真实运行会调用模型并产生费用；Claude Code 自身的标题生成等
+辅助请求不写入 session log，不在分析范围内。
+
 ## 原有快速探测
 
 ```sh
@@ -250,7 +316,7 @@ uv run check_prompt_cache.py YOUR_MODEL --probe-mode repeat --json
 ## 本地验证
 
 ```sh
-uv run python -m unittest -v test_agent_cache_probe
+uv run python -m unittest -v test_agent_cache_probe test_claude_code_probe
 ```
 
 测试使用合成 Messages 响应和本地 MockTransport，验证签名回传、并行工具
