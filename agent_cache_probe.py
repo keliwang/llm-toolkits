@@ -185,27 +185,23 @@ def _metrics(payload: dict[str, Any]) -> dict[str, int | float | None]:
         "input_tokens": ("input_tokens", "inputTokens"),
         "output_tokens": ("output_tokens", "outputTokens"),
     }
-    return {
+    metrics = {
         metric: next((usage[key] for key in keys if type(usage.get(key)) in (int, float)), None)
         for metric, keys in aliases.items()
     }
+    # Some gateways omit zero-valued cache counters; with input reported, absent means 0.
+    if metrics["input_tokens"] is not None:
+        for metric in METRICS[:2]:
+            if metrics[metric] is None:
+                metrics[metric] = 0
+    return metrics
 
 
-def _input_usage(detail: dict[str, Any], accounting: str) -> dict[str, Any]:
-    """Normalize documented counter semantics, never provider/model names."""
+def _input_usage(detail: dict[str, Any]) -> dict[str, Any]:
+    """Anthropic Messages usage: input excludes cache reads and writes."""
     creation, read, input_tokens = (detail.get(key) for key in METRICS[:3])
     valid = lambda value: type(value) in (int, float) and value >= 0
-    total = None
-    if valid(read) and valid(input_tokens):
-        if accounting == "anthropic" and valid(creation):
-            total = read + creation + input_tokens
-        elif accounting == "implicit":
-            total = read + input_tokens
-        elif accounting == "total":
-            total = input_tokens
-    # Contradictory counters cannot establish token boundaries or cost exposure.
-    if total is not None and (read > total or (valid(creation) and creation > total - read)):
-        total = None
+    total = read + creation + input_tokens if all(map(valid, (creation, read, input_tokens))) else None
     return {
         "total_input_tokens": total,
         "cache_read_tokens": read if valid(read) else None,
@@ -214,8 +210,8 @@ def _input_usage(detail: dict[str, Any], accounting: str) -> dict[str, Any]:
     }
 
 
-def _cache_ratio(detail: dict[str, Any], accounting: str = "anthropic") -> float | None:
-    usage = _input_usage(detail, accounting)
+def _cache_ratio(detail: dict[str, Any]) -> float | None:
+    usage = _input_usage(detail)
     total = usage["total_input_tokens"]
     return round(usage["cache_read_tokens"] / total, 4) if total else None
 
@@ -263,13 +259,13 @@ def _classify_hit(
 
 
 def _annotate_reuse(
-    rounds: list[dict[str, Any]], accounting: str, static_tokens: int | float | None,
+    rounds: list[dict[str, Any]], static_tokens: int | float | None,
     threshold: float = 0.95,
 ) -> None:
     previous = None
     for detail in rounds:
-        detail["normalized_usage"] = _input_usage(detail, accounting)
-        detail["cache_ratio"] = _cache_ratio(detail, accounting)
+        detail["normalized_usage"] = _input_usage(detail)
+        detail["cache_ratio"] = _cache_ratio(detail)
         if detail["stage"].startswith("static_calibration"):
             continue
         reuse = {"basis": "previous_request_input_prefix_estimate", "reason": "initial_request"}
@@ -289,7 +285,7 @@ def _annotate_reuse(
             elif "error" in previous or "error" in detail:
                 reuse["reason"] = "request_failed"
             elif old_total is None or total is None or old_total <= 0:
-                reuse["reason"] = "input_accounting_unknown"
+                reuse["reason"] = "input_usage_unavailable"
             elif total < old_total or (before == after and total != old_total):
                 reuse["reason"] = "input_boundary_changed"
             else:
@@ -329,27 +325,27 @@ def _annotate_reuse(
 
 def _static_reference(
     calibration: dict[str, Any], replay: dict[str, Any] | None,
-) -> tuple[int | float | None, str, str]:
+) -> tuple[int | float | None, str]:
+    # The run-unique system prompt keeps calibration cold, so explicit caches must
+    # report a write; a read alone may be a partial implicit hit, not the full prefix.
     if "error" not in calibration and all(type(calibration.get(key)) in (int, float) for key in METRICS[:2]):
-        cached = calibration[METRICS[0]] + calibration[METRICS[1]]
-        if cached > 0:
-            return cached, "explicit_static_prefix", "anthropic"
+        if calibration[METRICS[0]] > 0:
+            return calibration[METRICS[0]] + calibration[METRICS[1]], "explicit_static_prefix"
     if replay is not None and "error" not in calibration and "error" not in replay:
         cold_read, warm_read = (detail.get(METRICS[1]) for detail in (calibration, replay))
         cold_input, warm_input = (detail.get(METRICS[2]) for detail in (calibration, replay))
         counters = (cold_read, warm_read, cold_input, warm_input)
         if all(type(value) in (int, float) and value >= 0 for value in counters):
             cold_total, warm_total = cold_read + cold_input, warm_read + warm_input
-            # Identical requests: more reads replace exactly as many input tokens.
-            # This supports read+uncached-input accounting without assuming missing
-            # creation=0. Use the WHOLE short request as an upper bound, rather than
-            # a partially cached read (which could undercount the static prefix).
+            # Backends that never report cache writes: identical requests trade
+            # input for reads one-to-one. Use the WHOLE short request as an upper
+            # bound, rather than a partially cached read (which could undercount).
             if (
                 warm_read > cold_read and cold_total == warm_total and cold_total > 0
                 and all((detail.get(METRICS[0]) or 0) == 0 for detail in (calibration, replay))
             ):
-                return cold_total, "calibration_total_input_upper_bound", "implicit"
-    return None, "unavailable", "unknown"
+                return cold_total, "calibration_total_input_upper_bound"
+    return None, "unavailable"
 
 
 def _send(
@@ -531,7 +527,7 @@ def _flow_reasons(scenario: str, rounds: list[dict[str, Any]], tool_batches: lis
     return reasons
 
 
-def _phase_summary(evidence: list[dict[str, Any]], static_tokens: int | float | None, accounting: str) -> dict[str, Any]:
+def _phase_summary(evidence: list[dict[str, Any]], static_tokens: int | float | None) -> dict[str, Any]:
     read = any((detail.get("cache_read_input_tokens") or 0) > 0 for detail in evidence)
     write = any((detail.get("cache_creation_input_tokens") or 0) > 0 for detail in evidence)
     known_reads = [detail for detail in evidence if type(detail.get("cache_read_input_tokens")) in (int, float)]
@@ -558,7 +554,7 @@ def _phase_summary(evidence: list[dict[str, Any]], static_tokens: int | float | 
         state = "usage_unavailable"
     else:
         state = "request_failed"
-    complete_usage = bool(evidence) and all("error" not in detail and _cache_ratio(detail, accounting) is not None for detail in evidence)
+    complete_usage = bool(evidence) and all("error" not in detail and _cache_ratio(detail) is not None for detail in evidence)
     totals = {
         key: sum(detail[key] for detail in evidence) if all(type(detail.get(key)) in (int, float) for detail in evidence) else None
         for key in METRICS
@@ -590,7 +586,7 @@ def _phase_summary(evidence: list[dict[str, Any]], static_tokens: int | float | 
         "static_cached_tokens": static_tokens,
         "history_read_beyond_static_observed": beyond_static,
         "thinking_present_on_history_hit": thinking_hit,
-        "aggregate_cache_ratio": _cache_ratio(totals, accounting) if complete_usage else None,
+        "aggregate_cache_ratio": _cache_ratio(totals) if complete_usage else None,
         "usage_totals": totals if complete_usage else None,
         "reuse_transition_count": len(transitions), "measured_reuse_transition_count": len(measured),
         "old_input_reuse_ratio_estimate": old_read / old_total if complete_reuse else None,
@@ -602,13 +598,13 @@ def _phase_summary(evidence: list[dict[str, Any]], static_tokens: int | float | 
 
 def _summarize(
     rounds: list[dict[str, Any]], static_tokens: int | float | None,
-    cache_strategy: str, accounting: str = "anthropic", min_prefix_reuse: float = 0.95,
+    cache_strategy: str, min_prefix_reuse: float = 0.95,
 ) -> dict[str, Any]:
     progression = _phase_summary([
         detail for detail in rounds
         if not detail["stage"].startswith("static_calibration") and detail["stage"] != "verification_replay"
-    ], static_tokens, accounting)
-    replay = _phase_summary([detail for detail in rounds if detail["stage"] == "verification_replay"], static_tokens, accounting)
+    ], static_tokens)
+    replay = _phase_summary([detail for detail in rounds if detail["stage"] == "verification_replay"], static_tokens)
     if cache_strategy == "system":
         met = progression["cache_read_detected"]
         verdict = "STATIC HIT" if met else "CACHE NOT VERIFIED"
@@ -630,11 +626,8 @@ def _summarize(
     return {
         **progression, "progression": progression, "verification_replay": replay,
         "cache_requirement_met": met, "reuse_verdict": verdict,
-        "usage_accounting": accounting, "min_prefix_reuse_target": min_prefix_reuse,
-        "cache_ratio_basis": {
-            "anthropic": "read / (read + creation + uncached input)",
-            "implicit": "read / (read + input)", "total": "read / input", "unknown": "unknown",
-        }[accounting],
+        "min_prefix_reuse_target": min_prefix_reuse,
+        "cache_ratio_basis": "read / (read + creation + uncached input); omitted cache counters count as 0",
         "hit_rule": f"HIT: read >= {min_prefix_reuse:g} x expected (initial: static prefix; later: previous request's whole input) and, after the initial request, read > static; STATIC: read <= static; MISS: read = 0",
         "thinking_hit_rule": "thinking_present_on_history_hit is True only when a request whose expected prefix already contains thinking blocks (sent as input by the previous request) is a HIT; None when no such request exists",
         "history_evidence_note": "Read beyond the static reference is some-history evidence. Old-input reuse assumes server-side contiguous prefix caching and unchanged tokenization. Previous assistant output first sent this round is NEW input. Aggregate usage cannot measure individual thinking/history blocks or actual billing.",
@@ -650,10 +643,8 @@ def run_agent_suite(
     tool_output_lines: int, round_delay_ms: int, timeout: int,
     extra_headers: dict[str, str], dry_run: bool = False,
     client: httpx.Client | None = None,
-    usage_accounting: str = "auto", min_prefix_reuse: float = 0.95,
+    min_prefix_reuse: float = 0.95,
 ) -> dict[str, Any]:
-    if usage_accounting not in {"auto", "anthropic", "implicit", "total"}:
-        raise ValueError("Unsupported usage accounting")
     if not 0 <= min_prefix_reuse <= 1:
         raise ValueError("min_prefix_reuse must be between 0 and 1")
     if thinking not in {"adaptive", "enabled", "off"}:
@@ -719,16 +710,10 @@ def run_agent_suite(
                     cache_strategy="system", **options,
                 )
                 calibration = send(calibration_body, "static_calibration")
-                static_tokens, reference_source, accounting = _static_reference(calibration, None)
+                static_tokens, reference_source = _static_reference(calibration, None)
                 if static_tokens is None and "error" not in calibration:
                     calibration_replay = send(deepcopy(calibration_body), "static_calibration_replay")
-                    static_tokens, reference_source, accounting = _static_reference(calibration, calibration_replay)
-                if usage_accounting != "auto":
-                    accounting = usage_accounting
-                    if reference_source != "explicit_static_prefix":
-                        total = _input_usage(calibration, accounting)["total_input_tokens"]
-                        static_tokens = total
-                        reference_source = "calibration_total_input_upper_bound" if total is not None else "unavailable"
+                    static_tokens, reference_source = _static_reference(calibration, calibration_replay)
                 workflow_start = len(details)
                 tool_batches = []
                 completed_turns = 0
@@ -790,8 +775,8 @@ def run_agent_suite(
                     replay = send(deepcopy(last_body), "verification_replay")
                     if "error" in replay:
                         reasons.append("verification_replay_failed")
-                _annotate_reuse(details, accounting, static_tokens, min_prefix_reuse)
-                summary = _summarize(details, static_tokens, strategy, accounting, min_prefix_reuse)
+                _annotate_reuse(details, static_tokens, min_prefix_reuse)
+                summary = _summarize(details, static_tokens, strategy, min_prefix_reuse)
                 results[f"{scenario}/{strategy}"] = {
                     "scenario": scenario, "cache_strategy": strategy,
                     "anthropic_beta": request_headers.get("anthropic-beta"),
@@ -812,7 +797,7 @@ def run_agent_suite(
         "run_id": run_id, "stream": stream, "ttl": ttl,
         "thinking": thinking_config, "effort": effort,
         "pin_previous_message": pin_previous_message,
-        "usage_accounting_requested": usage_accounting, "min_prefix_reuse_target": min_prefix_reuse,
+        "min_prefix_reuse_target": min_prefix_reuse,
         "dry_run": dry_run, "plans": plans,
         "all_scenarios_passed": bool(results) and all(result["passed"] for result in results.values()),
         "all_cache_requirements_met": bool(results) and all(result["cache_requirement_met"] for result in results.values()),
@@ -852,7 +837,7 @@ def print_report(report: dict[str, Any], verbose: bool = False) -> None:
         reuse, worst = result["old_input_reuse_ratio_estimate"], result["min_old_input_reuse_ratio_estimate"]
         reuse_text = f"{reuse:.2%} (min {worst:.2%})" if reuse is not None else "unknown"
         print(f"\n[{name}] cache={result['reuse_verdict']}  flow={flow}  reuse={reuse_text}  "
-              f"static={_fmt(result['static_cached_tokens'])} ({result['usage_accounting']})")
+              f"static={_fmt(result['static_cached_tokens'])} ({result['static_reference_source']})")
         print(f"  {'#':>2}  {'stage':<11} {'resp':<12} {'input':>7} {'read':>7} {'Δread':>8} {'expect':>7} {'miss':>5}  hit")
         index = 0
         for detail in result["rounds"]:
@@ -919,7 +904,7 @@ def _print_verbose_report(report: dict[str, Any]) -> None:
         if first and result["cache_strategy"] != "system":
             print(f"  first non-HIT: request #{first['request']} {first['stage']} {first['label']} expected={first['expected_read_tokens']} read={first['read_tokens']}" + (f" ({first['reason']})" if "reason" in first else ""))
         print(f"  state={result['detection_state']} static_tokens={result['static_cached_tokens']} history_hit={result['history_read_beyond_static_observed']} thinking_on_history_hit={result['thinking_present_on_history_hit']}")
-        print(f"  static_reference={result['static_reference_source']} usage_accounting={result['usage_accounting']}")
+        print(f"  static_reference={result['static_reference_source']}")
         progression, replay = result["progression"], result["verification_replay"]
         print(f"  progression: cache_ratio={percent(progression['aggregate_cache_ratio'])} old_input_reuse={percent(progression['old_input_reuse_ratio_estimate'])} worst={percent(progression['min_old_input_reuse_ratio_estimate'])} old_input_miss={progression['old_input_miss_tokens_estimate']} transitions={progression['measured_reuse_transition_count']}/{progression['reuse_transition_count']}")
         print(f"  replay (diagnostic): cache_ratio={percent(replay['aggregate_cache_ratio'])} old_input_reuse={percent(replay['old_input_reuse_ratio_estimate'])} history_hit={replay['history_read_beyond_static_observed']}")

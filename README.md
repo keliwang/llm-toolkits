@@ -227,18 +227,11 @@ uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent \
 
 JSON 报告包含逐轮 usage、命中比例、耗时、stop_reason、thinking/工具数量、
 缓存断点位置以及请求/system/tools 的哈希；不输出请求鉴权或 thinking 内容。
-`usage_accounting` 记录使用的计数口径，不按模型名做分支。
-默认 `--usage-accounting auto` 通过校准建立口径；若第三方计数语义已确认，
-可显式选择以下值，避免未公开字段使自动判断失败：
-
-| 值 | 输入总量 |
-| --- | --- |
-| `anthropic` | `input + cache_read + cache_creation`，三项须提供 |
-| `implicit` | `input + cache_read`，input 包括全部未命中部分 |
-| `total` | `input` 已包含所有输入，cache_read 是其中的子集 |
-
-这些选择只改变本地统计，不改变请求体。显式配置应依据对应网关的 usage
-语义，不能只因为缺少 create 就选择 implicit。计数缺失或自相矛盾时仍报告未知。
+输入总量统一按 Anthropic Messages usage 计算：`input + cache_read + cache_creation`，
+其中 input 不含缓存读写。有 `input_tokens` 时，缺失的缓存计数按 0 处理（部分网关
+省略值为 0 的字段）；整个 usage 缺失时报告未知。不支持把缓存读取算进 `input_tokens`
+的非标准网关。静态前缀基准优先取冷校准请求的 `cache_creation + cache_read`；
+不报告缓存写入的后端则重放同一校准请求，用总输入作为上界（`static_reference_source`）。
 `--no-stream` 可测试非流式接口。需要额外 beta 或网关鉴权时，可重复指定
 `--header 'Name: Value'`。Agent 模式下 `--beta-mode auto` 不做旧缓存 beta 的
 自动回退，以免改变场景内的请求配置；`on` 可显式添加旧 header。

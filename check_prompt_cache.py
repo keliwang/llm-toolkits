@@ -629,7 +629,6 @@ def main() -> None:
     agent.add_argument("--effort", choices=("none", "low", "medium", "high", "xhigh", "max"), default="high", help="agent 请求的 output_config.effort，默认 high，整个场景保持不变；none 不发送 output_config")
     agent.add_argument("--thinking", choices=("adaptive", "enabled", "off"), default="adaptive", help="thinking 配置：adaptive（默认）、enabled（手动预算，适合不支持 adaptive 的模型）、off（不发送 thinking，默认跳过 thinking 场景）")
     agent.add_argument("--thinking-budget", type=int, default=4096, help="--thinking enabled 的 budget_tokens，默认 4096，需 >=1024 且小于 --max-tokens")
-    agent.add_argument("--usage-accounting", choices=("auto", "anthropic", "implicit", "total"), default="auto", help="输入计数口径：auto 校准；anthropic=input+read+create；implicit=input+read；total=input 已包含全部输入")
     agent.add_argument("--min-prefix-reuse", type=float, default=0.95, help="每次实际推进的旧输入复用率验收目标，0~1，默认 0.95；旧输入包含静态上下文")
     agent.add_argument("--max-tokens", type=int, default=8192, help="agent 单请求输出上限，默认 8192")
     agent.add_argument("--cache-ttl", choices=("5m", "1h"), default="5m", help="统一断点 TTL，默认 5m（API key 模式）")
@@ -714,7 +713,7 @@ def main() -> None:
             turns=args.agent_turns, max_requests=args.max_agent_requests,
             tool_output_lines=args.tool_output_lines, round_delay_ms=args.round_delay_ms,
             timeout=args.timeout, extra_headers=extra_headers, dry_run=args.dry_run,
-            usage_accounting=args.usage_accounting, min_prefix_reuse=args.min_prefix_reuse,
+            min_prefix_reuse=args.min_prefix_reuse,
         )
         if args.json_output or args.dry_run:
             print(json.dumps(result, indent=2, ensure_ascii=False))

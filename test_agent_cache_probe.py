@@ -144,16 +144,6 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertGreater(result["old_input_reuse_ratio_estimate"], 0.95)
         self.assertEqual(result["rounds"][3]["prefix_reuse"]["old_history_reuse_ratio_lower_bound"], 0)
 
-    def test_total_accounting_override_does_not_double_count_reads(self):
-        trace = [(0, 5907), (5120, 5907), (5120, 5979), (5888, 6075), (5120, 6174), (6144, 6174)]
-        unknown = self.run_token_trace("text_multiturn", trace)
-        self.assertEqual(unknown["reuse_verdict"], "REUSE UNKNOWN")
-        known = self.run_token_trace("text_multiturn", trace, usage_accounting="total")
-        self.assertEqual(known["rounds"][3]["normalized_usage"]["total_input_tokens"], 6075)
-        self.assertEqual(known["old_input_miss_tokens_estimate"], 1046)
-        self.assertEqual(known["reuse_verdict"], "REPLAY ONLY")
-        self.assertEqual(known["hit_timeline"], ["PARTIAL", "STATIC", "STATIC"])
-
     def test_rewritten_history_and_changed_config_cannot_estimate_reuse(self):
         fixture = MessagesFixture()
         run_fixture(fixture, ["thinking_tool"])
@@ -170,7 +160,7 @@ class AgentProtocolTests(unittest.TestCase):
                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1000, "input_tokens": 100}
                 for i, (stage, body) in enumerate((("initial_user_turn", before), ("tool_result_followup", changed)))
             ]
-            _annotate_reuse(details, "anthropic", 900)
+            _annotate_reuse(details, 900)
             reuse = details[1]["prefix_reuse"]
             self.assertFalse(reuse["prefix_preserved"])
             self.assertEqual(reuse["reason"], "request_configuration_or_history_changed")
@@ -190,7 +180,7 @@ class AgentProtocolTests(unittest.TestCase):
             detail("tool_result_followup", 6500, 1000, 3, ["a", "b", "c", "d"]),
             detail("tool_result_followup", 0, 9000, 3, ["a", "b", "c", "d", "e"]),
         ]
-        _annotate_reuse(details, "anthropic", 5907)
+        _annotate_reuse(details, 5907)
         self.assertEqual([d["hit"]["label"] for d in details], ["HIT", "HIT", "STATIC", "PARTIAL", "MISS"])
         self.assertEqual(details[2]["hit"]["expected_read_tokens"], 6513)
         self.assertEqual(details[2]["hit"]["missed_tokens"], 606)
@@ -263,10 +253,11 @@ class AgentProtocolTests(unittest.TestCase):
         self.assertEqual(result["read_drops"][0]["kind"], "decrease")
         self.assertEqual(result["read_drops"][0]["delta"], -128)
 
-    def test_contradictory_counters_cannot_establish_total_input(self):
+    def test_total_input_needs_every_counter(self):
         detail = {"cache_read_input_tokens": 200, "cache_creation_input_tokens": None, "input_tokens": 100}
-        self.assertIsNone(_input_usage(detail, "total")["total_input_tokens"])
-        self.assertEqual(_input_usage(detail, "implicit")["total_input_tokens"], 300)
+        self.assertIsNone(_input_usage(detail)["total_input_tokens"])
+        detail["cache_creation_input_tokens"] = 50
+        self.assertEqual(_input_usage(detail)["total_input_tokens"], 350)
 
     def test_all_scenarios_complete_and_reuse_history(self):
         fixture = MessagesFixture()
@@ -357,30 +348,51 @@ class AgentProtocolTests(unittest.TestCase):
         report = run_fixture(handler, ["thinking_interleaved"])
         result = report["scenarios"]["thinking_interleaved/claude-code"]
         self.assertTrue(result["passed"])
-        self.assertEqual(result["usage_accounting"], "implicit")
         self.assertEqual(result["static_reference_source"], "calibration_total_input_upper_bound")
         self.assertEqual(fixture.requests[0], fixture.requests[1])
         self.assertEqual(result["rounds"][1]["stage"], "static_calibration_replay")
         self.assertTrue(result["thinking_present_on_history_hit"])
-        self.assertIsNone(result["usage_totals"]["cache_creation_input_tokens"])
+        self.assertEqual(result["usage_totals"]["cache_creation_input_tokens"], 0)
         self.assertGreater(result["aggregate_cache_ratio"], 0)
+
+    def test_omitted_zero_cache_counters_count_as_zero(self):
+        fixture = MessagesFixture()
+
+        def handler(request):
+            payload = fixture(request).json()
+            usage = payload["usage"]
+            # Gateway reports only the non-zero cache counter.
+            for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                if usage[key] == 0:
+                    del usage[key]
+            return httpx.Response(200, json=payload)
+
+        report = run_fixture(handler, ["thinking_interleaved"])
+        result = report["scenarios"]["thinking_interleaved/claude-code"]
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["static_reference_source"], "explicit_static_prefix")
+        self.assertNotIn("UNKNOWN", result["hit_timeline"])
 
     def test_partial_static_read_is_not_a_safe_history_baseline(self):
         cold = {"cache_read_input_tokens": 0, "cache_creation_input_tokens": None, "input_tokens": 5904}
         warm = {"cache_read_input_tokens": 5120, "cache_creation_input_tokens": None, "input_tokens": 784}
-        reference, source, accounting = _static_reference(cold, warm)
+        reference, source = _static_reference(cold, warm)
         # 5888 > 5120 could still be entirely static: use the full 5904 bound.
         self.assertEqual(reference, 5904)
-        self.assertEqual(accounting, "implicit")
         self.assertEqual(source, "calibration_total_input_upper_bound")
 
-    def test_missing_creation_with_ambiguous_input_accounting_stays_unknown(self):
+    def test_cold_read_without_write_is_not_an_explicit_static_prefix(self):
+        # Implicit cache partially hitting a shared prefix; creation omitted (=0).
+        cold = {"cache_read_input_tokens": 1024, "cache_creation_input_tokens": 0, "input_tokens": 4880}
+        self.assertEqual(_static_reference(cold, None), (None, "unavailable"))
+
+    def test_missing_creation_without_matching_replay_stays_unknown(self):
         # Input could exclude undisclosed creation, or include cache reads already.
         cold = {"cache_read_input_tokens": 0, "cache_creation_input_tokens": None, "input_tokens": 20}
         warm = {"cache_read_input_tokens": 5120, "cache_creation_input_tokens": None, "input_tokens": 20}
-        self.assertEqual(_static_reference(cold, warm), (None, "unavailable", "unknown"))
+        self.assertEqual(_static_reference(cold, warm), (None, "unavailable"))
         cold["input_tokens"] = warm["input_tokens"] = 5904
-        self.assertEqual(_static_reference(cold, warm), (None, "unavailable", "unknown"))
+        self.assertEqual(_static_reference(cold, warm), (None, "unavailable"))
 
     def test_failed_case_does_not_skip_later_cases(self):
         fixture = MessagesFixture()
