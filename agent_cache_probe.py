@@ -437,6 +437,13 @@ def _initial_messages(scenario: str) -> list[dict[str, Any]]:
             "Then Read ONLY the entrypoint path named in that result in a separate response. "
             "After that result arrives, analyze the function and explain it briefly."
         )
+    if scenario in THINKING_SCENARIOS:
+        # Adaptive thinking often skips reasoning before tool calls; ask for it explicitly.
+        task += (
+            " This task requires careful reasoning. Before EVERY tool call, think step by step about "
+            "what you expect to find and why the call is needed. After each tool result arrives, "
+            "reflect on what it shows before deciding the next step."
+        )
     return [{"role": "user", "content": [{"type": "text", "text": project}, {"type": "text", "text": task}]}]
 
 
