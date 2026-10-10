@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Agent probe recordings (--record recordings)
+recordings/

@@ -9,7 +9,7 @@
 uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent --timeout 120
 ```
 
-默认执行所有七个场景，使用 `claude-code` 缓存策略；可重复指定 `--scenario`：
+默认执行所有七个场景，可重复指定 `--scenario`：
 
 | 场景 | 实际请求流程 |
 | --- | --- |
@@ -30,7 +30,7 @@ thinking 块第一次作为输入发送时属于新增内容，要到再下一�
 在首轮工具后再做一次 Glob，保持纯工具循环；`thinking_followup` 用普通追问覆盖
 “工具链后接普通 user 消息”的情况；`thinking_interleaved` 靠第二次依赖读取。
 流程未走到“读取含 thinking 的前缀”那一步时，报告 `thinking_history_not_exercised`。流程结论和缓存结论相互独立：流程未完成时
-仍对已发生的请求给出缓存结论，并照常执行最终重放。工具错误重试不在场景范围内。
+仍对已发生的请求给出缓存结论。工具错误重试不在场景范围内。
 
 ### 请求策略
 
@@ -38,7 +38,7 @@ thinking 块第一次作为输入发送时属于新增内容，要到再下一�
 [官方缓存说明](https://code.claude.com/docs/en/prompt-caching)：
 
 - tools 的定义和顺序、system 和项目上下文在场景内保持稳定。
-- 项目上下文用会话开头的 `<system-reminder>` 文本表示；后续只在末尾追加内容。
+- 项目上下文（含探测文本）用会话开头 user 消息里的 `<system-reminder>` 表示；后续只在末尾追加内容。
 - 每次发送完整历史，原样保留 assistant 块，包括 thinking 的 signature 和
   redacted_thinking 的 data。
 - 默认设置 system 末尾和最后一个可缓存消息末尾的显式 cache_control。
@@ -78,119 +78,61 @@ Adaptive 可能在简单请求中不产生 thinking，此时相应 thinking 专�
 uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent --thinking off --effort none
 ```
 
-### 静态命中与历史命中
+### 命中判定
 
-每个场景/策略使用独立随机前缀，避免不同场景和运行之间互相预热。流程是：
+每个场景只跑一遍真实 agent 循环，逐请求记录 usage，不再有静态校准和最终重放。
+默认七个场景正常完成时共 20 次请求。
 
-1. 用相同 tools、system 和 thinking 配置发一个只标记 system 的短请求，校准
-   静态缓存 token 数。这个请求会预热 tools+system，报告为 `static_calibration`。
-   如果无法从写入量建立基线，会原样重放该短请求，报告为
-   `static_calibration_replay`。当同一请求的 read 增加、input 等量减少且二者之和
-   保持一致时，按隐式缓存的“命中 + 未命中输入”口径处理，并使用整个短请求的
-   输入总量作为静态前缀的保守上界；不会用可能只命中部分前缀的 read 当作其
-   完整长度。如果计数口径无法确认，历史复用仍报告未知。
-2. 执行实际 agent 对话，每轮回传完整历史并记录 usage。
-3. 场景完成后原样重放最后一次请求，验证最后一次写入的历史前缀。重放响应
-   不加入主对话，报告为 `verification_replay`。
+Claude Code 在最后一条消息上打缓存断点，所以第 n 个请求应至少读到第 n-1 个请求的
+输入总量 `P = input + cache_read + cache_creation`（Anthropic Messages 口径，input
+不含缓存读写）。规则与 `claude_code_probe.py` 相同：
 
-报告把 `progression`（实际 agent 推进）和 `verification_replay`（诊断重放）
-分别汇总，校准和重放不计入实际推进的命中比例、重复输入未命中量或验收结果。
-`history_read_beyond_static_observed` 和 `thinking_present_on_history_hit` 现在只
-描述实际推进：前者表示至少一次 cache read 超过静态参考值；后者只在某个请求的
-**期望缓存前缀里已经包含 thinking 块**（即上一请求已把它作为输入发出）且该请求
-判定为 `HIT` 时为 true，本请求才首次发送的 thinking 不算。没有这样的请求时为
-`null`。`thinking_prefix_hits/thinking_prefix_checks` 给出对应计数。它们仍不能
-证明每个 thinking token 都命中。
-
-### 逐请求命中判定
-
-每个实际推进请求都对比“理论上应该读到多少”和“实际读到多少”：
-
-- 首个请求：期望读到校准预热的静态前缀 `S`（tools + system）。
-- 之后的请求：上一个请求在末尾打了断点，期望读到上一个请求的完整输入 `P`。
-
-| 标签 | 条件 | 含义 |
-| --- | --- | --- |
-| `HIT` | `read ≥ 阈值 × 期望`，且（首个请求除外）`read > S` | 上一轮写入的前缀基本全部命中 |
-| `PARTIAL` | 读到了超过 `S` 的部分，但未达阈值 | 历史部分命中，`missed` 为漏掉的 token |
-| `STATIC` | `0 < read ≤ S` | 只命中 tools+system，历史完全没有被证明命中 |
-| `MISS` | `read = 0` | 完全未命中 |
-| `UNKNOWN` | 前缀/配置变化、usage 口径未知、静态参考缺失等 | 无法判定，附带原因 |
-
-阈值就是 `--min-prefix-reuse`（默认 0.95）。报告中每个场景显示一条命中时间线，
-例如 `HIT → HIT → STATIC → HIT`，以及首个非 `HIT` 请求的阶段、期望值和实际值，
-可以直接定位哪一轮丢了缓存。期望前缀已包含 thinking 块的请求标记为 `HIT(t)`
-等形式，每轮详情中的 `thinking_in_expected_prefix` 给出块数。JSON 中对应 `hit_timeline`、`hit_counts`、
-`missed_tokens`、`first_non_hit` 和每轮的 `hit`。
-
-### 逐轮复用与成本暴露
-
-先确认前后请求的 tools、system、thinking/effort 等配置不变，历史只是追加；
-比较时忽略移动的 `cache_control` 标记，但完整保留工具参数和 thinking 签名。
-再将 usage 统一成输入总量 `T`、读取缓存量 `C` 和未读取缓存量 `T-C`。
-设上一轮输入总量为 `P`，在服务端保持相同分词及连续前缀缓存的前提下：
-
-| 指标 | 计算与意义 |
+| 标签 | 条件 |
 | --- | --- |
-| `cache_ratio` | `C/T`，这一轮整体输入命中比例 |
-| `old_input_reuse_ratio_estimate` | `min(C,P)/P`，已经作为输入发送过的旧前缀复用率 |
-| `old_input_miss_tokens_estimate` | `max(P-C,0)`，重复发送但未读到缓存的旧输入 |
-| `new_input_tokens_estimate` | `T-P`，本轮新增输入，包括上一轮刚生成、首次回传的 assistant 内容 |
-| `old_history_reuse_ratio_lower_bound` | 静态参考值 `S` 为长度或保守上界时，`max(min(C,P)-S,0)/(P-S)`；只在 `P>S` 时报告 |
+| `FIRST` | 场景首个请求，没有期望值 |
+| `HIT` | `read ≥ 阈值 × P` |
+| `PARTIAL` | `0 < read < 阈值 × P` |
+| `MISS` | `read = 0` |
+| `UNKNOWN` | 本次或上次 usage 缺失 |
 
-旧输入包括 tools、system 和旧消息，**旧输入复用率不是纯对话历史复用率**。
-历史复用率下界用于避免静态上下文很长时掩盖历史未命中；下界为 0 表示没有
-正下界证据，不表示历史一定完全没命中。前缀或配置改变、usage 口径不明、
-输入长度异常（包括同一请求重放却改变长度）时，复用指标报告未知。
-这些是基于汇总 token 计数的估计，无法校验网关内部改写或 thinking 过滤，
-也不能按消息/块精确归因。首轮没有上一轮 agent 输入，因此没有旧输入指标。
+阈值是 `--min-prefix-reuse`（默认 0.95），用于容忍分块缓存造成的少量尾部差异；
+需要零遗漏时可设为 `1`。期望前缀里已包含 thinking 块（上一请求已把它作为输入发出）
+的请求标为 `HIT(t)` 等形式，`thinking_prefix_hits/thinking_prefix_checks` 给出计数；
+本请求才首次发送的 thinking 不算。
 
-例如你提供的普通对话：上一轮 `T=6075`，下一轮 `C=5120, T=6174`，则旧输入
-约有 **955 tokens** 未命中，复用率约 **84.28%**，新增输入约 **99 tokens**。
-即使最终重放命中率达到 99.51%，也不能掩盖推进时的这次未命中。
+为避免“只命中 tools+system 却因占比高被判 HIT”，大段项目上下文（`--repeat-count`
+控制的探测文本）放在首条 user 消息的 `<system-reminder>` 里，与 Claude Code 放
+CLAUDE.md 的位置一致；tools+system 本身短于最小缓存长度。因此读到上一请求的
+完整输入只能来自消息断点。每个场景使用独立随机 system 前缀，互不预热。
 
-`not_read_tokens=T-C` 不等于按普通输入价格收费的 token 数：显式缓存接口
-还可能把它拆成写入和普通输入，两者价格不同。保留原始 read/create/input
-计数；缺失 create 始终是未知。脚本不猜测网关价格或把 token 比例当成实际
-费用折扣。实际费用需要结合对应接口的缓存读取、写入和普通输入单价。
-
-默认七个场景正常完成且校准提供写入量时共 34 次请求（包括校准和重放）；
-需要校准重放时最多增加 7 次请求。实际未完成的场景
-可能提前结束。`--max-agent-requests` 限制每个场景的主链路请求数，默认 8。
-`--agent-turns` 控制普通对话的用户轮数，默认 3。`--rounds` 仅用于原有快速探测。
-
-### 对照、预览和结果
-
-只测 thinking 工具链，同时比较两种缓存策略：
-
-```sh
-uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent \
-  --scenario thinking_interleaved --scenario thinking_followup \
-  --cache-strategy claude-code --cache-strategy system \
-  --timeout 120 --json
-```
-
-`system` 对照要求实际推进观察到缓存读取，显示 `STATIC HIT`。
-`claude-code` 的缓存结论由命中时间线得出：
+场景结论：
 
 | 结论 | 条件 |
 | --- | --- |
-| `PASS` | 至少有一次推进，且所有推进请求都是 `HIT` |
-| `REUSE UNKNOWN` | 存在 `UNKNOWN`，或只有首个请求 |
-| `PARTIAL REUSE` | 后续请求中有 `HIT`/`PARTIAL`，但不全是 `HIT` |
-| `REPLAY ONLY` | 推进中从未读到超过 `S` 的内容，只有诊断重放读到了 |
-| `STATIC ONLY` | 只有静态前缀读取 |
-| `CACHE NOT VERIFIED` | 没有任何缓存读取 |
-
-95% 是可调整的验收目标，不是任何提供方的缓存块大小、定价或完整历史命中
-保证。需要零估计遗漏时可设为 `1`，但分词边界也可能造成小差异。
+| `PASS` | 首个请求之后全部 `HIT` |
+| `PARTIAL REUSE` | 有 `HIT`/`PARTIAL`，但不全是 `HIT` |
+| `CACHE NOT VERIFIED` | 全部 `MISS` |
+| `REUSE UNKNOWN` | 存在 `UNKNOWN`，或只有一个请求 |
 
 报告标题同时显示 `cache=<结论>` 和 `flow=COMPLETE|INCOMPLETE (原因)`。
 JSON 里 `cache_requirement_met` 只看缓存，`passed` 要求两者都满足；
 顶层对应 `all_cache_requirements_met` 和 `all_scenarios_passed`。
-退出码按缓存结论：全部场景/策略满足缓存要求时为 0，否则为 1。
+退出码按缓存结论：全部场景满足缓存要求时为 0，否则为 1。
 
-不发请求，只查看场景计划和首轮请求体：
+`--max-agent-requests` 限制每个场景的请求数，默认 8；`--agent-turns` 控制普通对话的
+用户轮数，默认 3。`--rounds` 仅用于原有快速探测。
+
+### 预览和结果
+
+只测 thinking 工具链：
+
+```sh
+uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent \
+  --scenario thinking_interleaved --scenario thinking_followup \
+  --timeout 120 --json
+```
+
+不发请求，只查看各场景首轮请求体：
 
 ```sh
 uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent \
@@ -199,42 +141,88 @@ uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent \
 
 ### 读取报告
 
-默认文本报告每个场景一张表，只保留判断缓存所需的列：
+文本报告每个场景一张表，格式与真实会话探测相同：
 
 ```
-[tools_sequential/claude-code] cache=PARTIAL REUSE  flow=COMPLETE  reuse=49.53% (min 0.00%)  static=5932 (implicit)
-   #  stage       resp           input    read    Δread  expect  miss  hit
-   1  initial     think,tool×1    6025    5888        -    5932    44  HIT
-   2  tool_result think,tool×1    6122    6016     +128    6025     9  HIT
-   3  tool_result think,end       8000       0    ▼6016    6122  6122  MISS(t)  ◀ read fell to 0
-   r  replay      think,end       8000    7936    +7936    8000    64  HIT(t)
+[tools_sequential] cache=PARTIAL REUSE  requests=3  reuse=83.25%  overall_read=50.19%  missed=2035
+    #  turn  after       resp             input    read   Δread  expect   miss  hit  tools
+    1     1  prompt      think,tool×1      6025       0       -       -      -  FIRST    Read
+    2     1  tool_result think,tool×1      6122    6016   +6016    6025      9  HIT      Read
+    3     1  tool_result think,end_turn    8000    4096   ▼1920    6122   2026  PARTIAL(t)   ◀ read decreased
+  timeline: FIRST → HIT → PARTIAL(t)
+  first non-HIT: #3 turn 1 after tool_result: expect 6122, read 4096 (PARTIAL)
+  thinking-prefix hits: 0/1
+  flow=COMPLETE
 ```
 
 | 列 | 含义 |
 | --- | --- |
-| `resp` | 本次响应形态：是否有 thinking、调用了几个工具或正常结束 |
-| `input` | 本次输入总量（按计数口径归一化） |
+| `after` | 本请求跟在新的用户输入（`prompt`）还是 `tool_result` 之后 |
+| `resp` | 本次响应形态：是否有 thinking、调用了几个工具或结束原因 |
+| `input` | 本次输入总量 `input + cache_read + cache_creation` |
 | `read` | 本次缓存读取量 |
 | `Δread` | 与上一个请求的读取量之差；`▼` 表示下降 |
-| `expect` | 上一个请求留下的可缓存量（首个请求为静态前缀） |
-| `miss` | `expect - read` |
-| `hit` | 命中标签，`(t)` 表示期望前缀里已有 thinking 块 |
+| `expect` | 上一个请求的输入总量 |
+| `miss` | `max(expect - read, 0)` |
 
-对话只追加时，读取量不应下降。只要某个请求读得比上一个请求少（`decrease`），
-或者从非零跌到 0（`zero`），该行会标出 `◀`，报告末尾汇总到
-`⚠ Read drops`，JSON 中对应各阶段的 `read_drops` 和每轮的 `read_change`。
-校准请求只在出错时显示；完整的逐轮 usage 和估算明细使用 `--verbose`。
+对话只追加时读取量不应下降；下降或跌到 0 的行标出 `◀`，JSON 中对应 `read_drops`
+和每个请求的 `read_drop`。`reuse` 是所有推进请求 `Σmin(read, expect) / Σexpect`，
+`missed` 是对应的未命中 token 合计。
 
-JSON 报告包含逐轮 usage、命中比例、耗时、stop_reason、thinking/工具数量、
-缓存断点位置以及请求/system/tools 的哈希；不输出请求鉴权或 thinking 内容。
-输入总量统一按 Anthropic Messages usage 计算：`input + cache_read + cache_creation`，
-其中 input 不含缓存读写。有 `input_tokens` 时，缺失的缓存计数按 0 处理（部分网关
-省略值为 0 的字段）；整个 usage 缺失时报告未知。不支持把缓存读取算进 `input_tokens`
-的非标准网关。静态前缀基准优先取冷校准请求的 `cache_creation + cache_read`；
-不报告缓存写入的后端则重放同一校准请求，用总输入作为上界（`static_reference_source`）。
+JSON 报告包含每个请求的 usage、命中标签、耗时、stop_reason、thinking/工具数量、
+缓存断点位置和请求哈希；不输出请求鉴权或 thinking 内容。有 `input_tokens` 时，
+缺失的缓存计数按 0 处理（部分网关省略值为 0 的字段），常见 camelCase 别名会被
+归一化；整个 usage 缺失时报告 `UNKNOWN`。不支持把缓存读取算进 `input_tokens`
+的非标准网关。这些都是汇总 token 计数，不能按消息/块精确归因，也不等于实际费用。
 `--no-stream` 可测试非流式接口。需要额外 beta 或网关鉴权时，可重复指定
 `--header 'Name: Value'`。Agent 模式下 `--beta-mode auto` 不做旧缓存 beta 的
 自动回退，以免改变场景内的请求配置；`on` 可显式添加旧 header。
+
+### 录制请求与回复
+
+排查问题时加 `--record DIR`，把每个请求和回复原样写到本地：
+
+```sh
+uv run check_prompt_cache.py YOUR_MODEL --probe-mode agent --record recordings
+```
+
+每次运行新建 `DIR/<时间>-<run_id 前 8 位>/`，其中每个场景一个 `<场景>.jsonl`，每个请求
+一行，请求返回后立即写入，进程卡住或中断时已发生的请求也会保留；场景全部结束后再写入
+`report.json`（即 `--json` 的报告，含每个请求的命中标签，按 `index` 与 jsonl 对应）。
+每行字段：
+
+| 字段 | 内容 |
+| --- | --- |
+| `index` / `turn` / `after` | 与报告表格相同的请求序号、用户轮次和前一条输入类型 |
+| `started_at` / `elapsed_ms` | 发出时间（UTC）和耗时 |
+| `request` | `url`、`headers`、完整请求体 `body`（含 `cache_control` 断点和完整历史） |
+| `response.status_code` / `headers` | HTTP 状态码和响应头 |
+| `response.body` | 原始响应文本；流式时是完整 SSE 流，解析失败或非 2xx 时同样保留 |
+| `response.message` | 解析后的 Messages 对象（流式时为重组结果），失败时为 `null` |
+| `usage` | 归一化的 `input/read/creation/total/output` |
+| `error` | 请求或解析错误（如有） |
+
+请求头和响应头里名字包含 key、token、auth、secret、cookie、password、signature 的值
+替换为 `<redacted>`，所以 `x-api-key` 和 `--header 'Authorization: ...'` 不会落盘。
+但请求和回复正文会完整保存，**包括 thinking 文本和签名**，以及你通过 `--header`
+加入的其他非敏感头；分享录制文件前请自行检查。
+
+常用查看方式：
+
+```sh
+R=recordings/<时间>-<run>
+# 每个请求一行：usage、消息数、最后一条消息和回复的块类型
+jq -c '{index, after, usage, msgs: (.request.body.messages|length),
+        last: (.request.body.messages[-1].content|map(.type)),
+        resp: (.response.message.content|map(.type))}' $R/tools_sequential.jsonl
+# 第 3 个请求的完整请求体 / 断点位置
+jq 'select(.index == 3) | .request.body' $R/tools_sequential.jsonl
+jq -c '.request.body.messages | to_entries | map(select(any(.value.content[]; has("cache_control"))) | .key)' $R/tools_sequential.jsonl
+# 原始 SSE 流
+jq -r 'select(.index == 1) | .response.body' $R/thinking_tool.jsonl
+```
+
+请求体包含完整历史，因此相邻两行可以直接 diff 确认历史只是追加。
 
 ## 真实 Claude Code 会话探测
 
@@ -288,7 +276,7 @@ session log 里每个内容块一行；并行工具调用时 `tool_result` 会�
   输入总量 `P = input + cache_read + cache_creation`。
 - `read ≥ 阈值 × P` 为 `HIT`，`0 < read` 为 `PARTIAL`，`read = 0` 为 `MISS`；首个请求标为
   `FIRST`，没有期望值。`(t)`、`Δread`、`◀` 读取下降标记以及 `PASS`/`PARTIAL REUSE`/
-  `CACHE NOT VERIFIED`/`REUSE UNKNOWN` 的含义与 agent 模拟场景一致。
+  `CACHE NOT VERIFIED`/`REUSE UNKNOWN` 的含义与 agent 模拟场景一致（两者共用同一判定代码）。
 - `after` 列区分请求是跟在 `tool_result` 还是新的用户输入之后，汇总
   `user-prompt boundary hits`，用于定位“换轮时丢缓存”。
 - 正常情况下每步只差末尾少量未缓存 token（Claude Code 会话里通常是 2）。
@@ -320,6 +308,6 @@ uv run python -m unittest -v test_agent_cache_probe test_claude_code_probe
 ```
 
 测试使用合成 Messages 响应和本地 MockTransport，验证签名回传、并行工具
-结果配对、流式事件重建、静态命中误判、场景隔离、重放掩盖推进未命中、
-计数口径与前缀变化；不调用真实 API。真实缓存
+结果配对、流式事件重建、只命中 tools+system 不能通过、场景隔离、逐请求
+命中标签与计数口径；不调用真实 API。真实缓存
 能力需要用目标接口运行场景套件验证。
