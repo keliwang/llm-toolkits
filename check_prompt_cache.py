@@ -488,7 +488,7 @@ def check_cache_support(
     api_key: str,
     timeout: int = 60,
     beta_mode: str = "auto",
-    repeat_count: int = 64,
+    repeat_count: int = 100,
     rounds: int = 2,
     round_delay_ms: int = 250,
     probe_mode: str = "auto",
@@ -601,8 +601,8 @@ def main() -> None:
     parser.add_argument(
         "--repeat-count",
         type=int,
-        default=64,
-        help="探测文本重复次数，默认 64",
+        default=100,
+        help="探测文本重复次数，默认 100（agent 首个请求约 8.7k token；部分网关如 Vertex Gemini 隐式缓存需 8k 左右才开始命中）",
     )
     parser.add_argument(
         "--rounds",

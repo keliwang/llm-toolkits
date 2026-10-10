@@ -104,6 +104,8 @@ Claude Code 在最后一条消息上打缓存断点，所以第 n 个请求应�
 控制的探测文本）放在首条 user 消息的 `<system-reminder>` 里，与 Claude Code 放
 CLAUDE.md 的位置一致；tools+system 本身短于最小缓存长度。因此读到上一请求的
 完整输入只能来自消息断点。每个场景使用独立随机 system 前缀，互不预热。
+`--repeat-count` 默认 100，首个请求约 8.7k token：Vertex Gemini 等隐式缓存实现在
+6k 左右的前缀上完全不命中，约 8k 起才出现读取。
 
 场景结论：
 
