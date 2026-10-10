@@ -295,13 +295,15 @@ def _initial_messages(scenario: str, probe_text: str) -> list[dict[str, Any]]:
         task = (
             "Read /probe/alpha.py and /probe/beta.py using two Read calls in the SAME response, "
             "since the reads are independent. After both results arrive, call Glob with pattern /probe/*.py "
-            "in a separate response to check for other variants. Then compare the functions and explain their difference briefly."
+            "in a separate response to list the variants, but do not Read any file it lists. "
+            "Then compare only alpha.py and beta.py and explain their difference briefly."
         )
     elif scenario == "thinking_tool":
         # The second tool round makes a later request re-read the first thinking block.
         task = (
             "Read /probe/main.py once. After its result arrives, call Glob with pattern /probe/*.py "
-            "in a separate response to check for related files. Then reason about the function's behavior and give a brief explanation."
+            "in a separate response to list related files, but do not Read any file it lists. "
+            "Then reason about main.py's function behavior and give a brief explanation."
         )
     elif scenario == "thinking_followup":
         task = "Read /probe/main.py once. After its result arrives, reason about the function's behavior and give a brief explanation."
